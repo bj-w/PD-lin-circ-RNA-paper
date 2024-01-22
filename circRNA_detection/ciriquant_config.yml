@@ -1,0 +1,12 @@
+name: BSJ_rerun
+tools:
+  bwa: /mnt/nfs/home/b8057117/.conda/envs/ciri/bin/bwa
+  hisat2: /mnt/nfs/home/b8057117/.conda/envs/ciri/bin/hisat2
+  stringtie: /mnt/nfs/home/b8057117/.conda/envs/ciri/bin/stringtie
+  samtools: /mnt/nfs/home/b8057117/.conda/envs/ciri/bin/samtools
+
+reference:
+  fasta: /nobackup/proj/ghwtcmr/ben/genomes/ensembl_101/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+  gtf: /nobackup/proj/ghwtcmr/ben/genomes/ensembl_101/Homo_sapiens.GRCh38.101.gtf
+  bwa_index: /nobackup/proj/ghwtcmr/ben/genomes/ensembl_101/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+  hisat_index: /nobackup/proj/ghwtcmr/Genomes_DD/HISAT2/GRCh38/grch38_tran/genome_tran

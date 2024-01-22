@@ -1,0 +1,471 @@
+---
+title: "Gene expression covariate selection (linear + circ)"
+format:
+    html:
+      code-fold: true
+editor: source
+editor_options:
+  chunk_output_type: console
+---
+
+This chunk contains import set up info
+```{r}
+library(here)
+library(DESeq2)
+library(data.table)
+library(pheatmap)
+library(tidyverse)
+library(janitor)
+library(ragg)
+library(variancePartition)
+library(ggpubr)
+library(ggtext)
+library(correlation)
+library(corrplot)
+library(cowplot)
+library(patchwork)
+library(broom)
+
+source(here("combinedLinCirc/PD-RNA/functions.R"))
+theme_set(plot_theme)
+```
+
+# Setup
+
+### Import DDS
+
+First I'm going to import DeseqDataSet (dds) objects for both gene expression and circular RNA which have been generated during the respective file setup scripts. These dds objects have not been filtered or had DE carried out on them.
+
+```{r}
+# gene dds
+dds_gene.ppmi <- read_rds(here("linear/data/ppmi_DDS_prefilter.rds"))
+dds_gene.icicle <- read_rds(here("linear/data/icicle_DDS_prefilter.rds"))
+
+# circRNA dds
+dds_circ.ppmi <- read_rds(here("circRNA/data/ppmi_bsj_DDS_preFilter.rds"))
+dds_circ.icicle <- read_rds(here("circRNA/data/icicle_bsj_DDS_preFilter.rds"))
+```
+
+### Import and set up metadata
+
+Next I'm going to import the metadata for each cohort. This includes various metrics that may influence the quantification of RNA. Setting useful categorical variables as factors and renaming to make some metrics consistent between cohorts
+
+```{r}
+meta.ppmi <- fread(here("ppmi/output/BL_iPD_HC_metadata.csv")) %>%
+  mutate(
+    id = as.character(id),
+    condition = factor(condition, levels = c('PD', 'HC')),
+    condition = recode(condition, 'HC' = 'Control', 'PD' = "PwP"),
+    sex = factor(sex, levels = c("Female", "Male")),
+    batch = factor(plate)
+  )
+
+meta.icicle <- fread(here("icicle/output/ICICLE_METADATA.csv")) %>%
+  mutate(
+    condition = factor(condition, levels = c('PD', 'HC')),
+    condition = recode(condition, 'HC' = 'Control', 'PD' = "PwP"),
+    sex = factor(sex, levels = c("Female", "Male")),
+    run = factor(run),
+    id = as.character(id)
+  ) %>%
+  rename(
+    age_at_consent = age,
+    batch = run
+  )
+```
+
+The metadata contains a lot of info, some of which aren't useful, so I'm going to filter for useful metrics
+
+```{r}
+# make a vector of useful metrics
+seq_metrics <- c(
+  "id",
+  "pct_r1_transcript_strand_reads",
+  "pct_r2_transcript_strand_reads",
+  "pct_ribosomal_bases",
+  "pct_coding_bases",
+  "pct_utr_bases",
+  "pct_intronic_bases",
+  "pct_intergenic_bases",
+  "pct_mrna_bases",
+  "pct_usable_bases",
+  "pct_correct_strand_reads",
+  "median_cv_coverage",
+  "median_5prime_bias",
+  "median_3prime_bias",
+  "median_5prime_to_3prime_bias",
+  "avg_insert_size"
+)
+
+# select all columns listed above using all_of (preferred over any_of as it'll produce an error if any are missing)
+seq_metrics.ppmi <- meta.ppmi %>%
+  select(all_of(seq_metrics))
+
+seq_metrics.icicle <- meta.icicle %>%
+  select(all_of(seq_metrics))
+```
+
+### Filtering counts
+
+I perform DE on filtered counts (\>10 raw counts in at least the smallest sample group), so need to filter these counts with the same threshold. Write a function to filter DDS objects
+```{r}
+filterDDS <- function(dds, metadata) {
+  # apply raw count filtering
+  keep <- rowSums(counts(dds, normalized = FALSE) > 10) > min(table(metadata$condition))
+  # how many genes removed
+  genesRemoved <- function(keep, metadata) {
+    total <- nrow(data.frame(keep))
+    ntrue <- data.frame(logical = keep) %>%
+      filter(logical == TRUE) %>%
+      nrow()
+    nfalse <- data.frame(logical = keep) %>%
+      filter(logical == FALSE) %>%
+      nrow()
+    print(paste0("Total number of genes tested: ", total))
+    print(paste0("Number of genes kept: ", ntrue, " (", round(ntrue / total * 100), "%)"))
+    print(paste0("Number of genes removed: ", nfalse, " (", round(nfalse / total * 100), "%)"))
+  }
+  genesRemoved(keep, metadata)
+  dds <- dds[keep, ]
+  return(dds)
+}
+```
+
+Run the function to filter the dds objects
+
+```{r}
+# gene
+dds_gene.ppmi <- filterDDS(dds_gene.ppmi, meta.ppmi)
+dds_gene.icicle <- filterDDS(dds_gene.icicle, meta.icicle)
+
+# circ
+dds_circ.ppmi <- filterDDS(dds_circ.ppmi, meta.ppmi)
+dds_circ.icicle <- filterDDS(dds_circ.icicle, meta.icicle)
+```
+
+
+# PCA
+
+First transform the counts using the VST to control for heterskedasticity of RNAseq count data
+```{r}
+vst_gene.ppmi <- assay(vst(dds_gene.ppmi, blind = FALSE))
+vst_gene.icicle <- assay(vst(dds_gene.icicle, blind = FALSE))
+
+# circ - use varianceStabilizingTransformation directly due to the low number of circRNAs
+vst_circ.ppmi <- assay(varianceStabilizingTransformation(dds_circ.ppmi, blind = FALSE))
+vst_circ.icicle <- assay(varianceStabilizingTransformation(dds_circ.icicle, blind = FALSE))
+```
+
+Run PCA using the prcomp function. We are centering but not scaling as the counts have been VST'd
+```{r}
+# gene
+pca_gene.ppmi <- prcomp(t(vst_gene.ppmi), center = TRUE)
+pca_gene.icicle <- prcomp(t(vst_gene.icicle), center = TRUE)
+
+# circ
+pca_circ.ppmi <- prcomp(t(vst_circ.ppmi), center = TRUE)
+pca_circ.icicle <- prcomp(t(vst_circ.icicle), center = TRUE)
+```
+
+Calculate the variance explained by each PC
+
+```{r}
+# round((prcomp.ppmi$sdev^2 / sum(prcomp.ppmi$sdev^2)) * 100, digits = 2)
+```
+
+### Screeplot
+
+### PC1 vs PC2
+
+# Relating metrics to PCs
+
+Here I am fitting a univariate linear model for each metric to PCs of gene and circRNA expression Below is a function to perform the linear modelling - requires the filtered metric df, objects produced by prcomp, and a number of PCs to calculate the models on Also included is a function to format the output
+```{r}
+lmPCA <- function(metricDF, prcompObject, PC) {
+  # metricDF$condition <- if_else(metricDF$condition == "PD", 1, 0)
+  # metricDF$batch <- as.numeric(metricDF$batch)
+  # metricDF$sex <- if_else(metricDF$sex == "Male", 1, 0)
+  map(c(1:PC), function(pc) {
+    map(names(metricDF[-1]), function(column) {
+      pc_df <- rownames_to_column(data.frame(pc = prcompObject[["x"]][, pc]), "id")
+      lm_df <- cbind(pc = prcompObject[["x"]][, pc], metricDF)
+      lm_output <- glance(lm(pc ~ ., data = lm_df %>% select(pc, {{ column }}))) %>%
+        mutate(metric = column, pc = pc)
+    })
+  })
+}
+
+format_lmPCA <- function(lmPCA_output, study) {
+  lmPCA_output %>%
+    # flatten first list level
+    list_flatten() %>%
+    # combine into one df
+    list_rbind() %>%
+    # remove models using id to predict PC
+    filter(metric != "id") %>%
+    mutate(
+      # adjust for multiple testing
+      fdr = p.adjust(p.value, method = "fdr"),
+      # give study name
+      study = {{ study }}
+    )
+}
+```
+
+Now run this function for the gene counts and circRNA counts
+
+```{r}
+# gene
+lmPCA_gene.ppmi <- lmPCA(metricDF = seq_metrics.ppmi, prcompObject = pca_gene.ppmi, PC = 10) %>%
+  format_lmPCA(study = "PPMI")
+
+lmPCA_gene.icicle <- lmPCA(metricDF = seq_metrics.icicle, prcompObject = pca_gene.icicle, PC = 10) %>%
+  format_lmPCA(study = "ICICLE-PD")
+
+# circ
+lmPCA_circ.ppmi <- lmPCA(metricDF = seq_metrics.ppmi, prcompObject = pca_circ.ppmi, PC = 10) %>%
+  format_lmPCA(study = "PPMI")
+
+lmPCA_circ.icicle <- lmPCA(metricDF = seq_metrics.icicle, prcompObject = pca_circ.icicle, PC = 10) %>%
+  format_lmPCA(study = "ICICLE-PD")
+```
+
+### Which metrics look interesting?
+
+View the R2 (proportion of variance explained) values in a heatmap Functions to produce the heatmaps and find colinear features
+
+```{r}
+metricHeatmap <- function(lmPCA_output, title) {
+  heatmap_df <- lmPCA_output %>%
+    select(r.squared, pc, metric) %>%
+    pivot_wider(id_cols = metric, names_from = pc, values_from = r.squared) %>%
+    column_to_rownames("metric")
+  breaksList <- seq(-0, 1, by = 0.01)
+  pheatmap(heatmap_df,
+    color = viridis::viridis(n = 100, alpha = 0.5),
+    breaks = breaksList,
+    cluster_cols = FALSE, border_color = "black", display_numbers = TRUE, main = title
+  )
+}
+
+corHighR2 <- function(lmPCA_output, metrics) {
+  highr2 <- lmPCA_output %>%
+    filter(
+      fdr < 0.05,
+      adj.r.squared >= 0.5
+    )
+  metrics <- metrics %>%
+    select(all_of(unique(highr2$metric))) %>%
+    select(where(is.numeric))
+  if (ncol(metrics) < 2) {
+    cat("Only one metric!\n")
+    return(names(metrics[, 1]))
+  } else {
+    cat("More than one numeric metric so correlating...\n")
+    metrics %>%
+      cor(., method = "spearman") %>%
+      pheatmap(display_numbers = TRUE)
+  }
+}
+```
+
+#### Gene
+
+Plot the heatmaps
+
+```{r}
+heatmap_gene.ppmi <- metricHeatmap(lmPCA_gene.ppmi, title = "PPMI")
+heatmap_gene.ppmi
+
+heatmap_gene.icicle <- metricHeatmap(lmPCA_gene.icicle, title = "ICICLE-PD")
+heatmap_gene.icicle
+```
+
+Find colinear features
+
+```{r}
+corHighR2(lmPCA_gene.ppmi, metrics = seq_metrics.ppmi)
+corHighR2(lmPCA_gene.icicle, metrics = seq_metrics.icicle)
+```
+
+Plot as panel
+```{r}
+ggplotify::as.ggplot(heatmap_gene.ppmi) / 
+  ggplotify::as.ggplot(heatmap_gene.icicle) /
+  ggplotify::as.ggplot(corHighR2(lmPCA_gene.icicle, metrics = seq_metrics.icicle)) +
+  plot_annotation(tag_levels = 'a')
+ggsave(here('combinedLinCirc/output/figures/supp/genePCheatmaps.svg'),
+       height = 10, width = 7)
+```
+
+
+#### Circs
+
+Heatmaps + colinear features
+
+```{r}
+heatmap_circ.ppmi <- metricHeatmap(lmPCA_circ.ppmi, title = "PPMI")
+heatmap_circ.ppmi
+corHighR2(lmPCA_circ.ppmi, metrics = seq_metrics.ppmi)
+
+heatmap_circ.icicle <- metricHeatmap(lmPCA_circ.icicle, title = "ICICLE-PD")
+heatmap_circ.icicle
+corHighR2(lmPCA_circ.icicle, metrics = seq_metrics.icicle)
+```
+
+Plot as panel
+```{r}
+ggplotify::as.ggplot(heatmap_circ.ppmi) / ggplotify::as.ggplot(heatmap_circ.icicle) + ggplotify::as.ggplot(corHighR2(lmPCA_circ.icicle, metrics = seq_metrics.icicle))
+ggsave(here('combinedLinCirc/output/figures/supp/circPCheatmaps.svg'),
+       height = 10, width = 7)
+```
+
+# Variance Partition
+
+Create formulae with added metrics from the PCA linear models
+
+```{r}
+# gene
+form_gene.ppmi <- ~
+  (1 | condition) +
+    (1 | sex) +
+    (1 | batch) +
+    age_at_consent +
+    pct_usable_bases
+
+form_gene.icicle <- ~
+  (1 | condition) +
+    (1 | sex) +
+    (1 | batch) +
+    age_at_consent +
+    pct_intronic_bases +
+    pct_coding_bases
+
+# circRNA
+form_circ.ppmi <- ~
+  (1 | condition) +
+    (1 | sex) +
+    (1 | batch) +
+    age_at_consent +
+    pct_intronic_bases
+
+form_circ.icicle <- ~
+  (1 | condition) +
+    (1 | sex) +
+    (1 | batch) +
+    age_at_consent +
+    pct_intronic_bases +
+    median_cv_coverage
+```
+
+### Run varianceParititon
+
+Function to run
+
+```{r}
+varPart <- function(vstObject, formula, infoDF) {
+  var_part_output <- fitExtractVarPartModel(vstObject, formula, infoDF)
+  var_part_output <- sortCols(var_part_output)
+  var_part_df <- data.frame(var_part_output) %>%
+    pivot_longer(cols = everything(), names_to = "covariate", values_to = "var_explain")
+  return(var_part_df)
+}
+```
+
+Run on on gene and circ expression seprately using the formulae I made earlier
+
+```{r}
+# gene
+varPart_gene.ppmi <- varPart(vst_gene.ppmi, form_gene.ppmi, meta.ppmi)
+varPart_gene.icicle <- varPart(vst_gene.icicle, form_gene.icicle, meta.icicle)
+
+# circ
+varPart_circ.ppmi <- varPart(vst_circ.ppmi, form_circ.ppmi, meta.ppmi)
+varPart_circ.icicle <- varPart(vst_circ.icicle, form_circ.icicle, meta.icicle)
+```
+
+### Visualise contribution of covariates
+
+Function
+
+```{r}
+varPart_plot <- function(varPart_df) {
+  varPart_df %>%
+    ggplot(aes(x = var_explain, y = fct_reorder(covariate, var_explain, .fun = median, .desc = FALSE))) +
+    geom_jitter(aes(colour = covariate), height = 0.2, alpha = 0.3) +
+    geom_boxplot(fill = NA, outlier.shape = NA) +
+    scale_colour_brewer(palette = "Set1") +
+    labs(
+      x = "Proportion of variance explained", y = "Covariate",
+      colour = "Covariate"
+    ) +
+    facet_wrap(~study, scale = "free_y") +
+    theme(legend.position = "top")
+}
+```
+
+Plot as a facet to bind output dfs together making sure to add a column specifying which cohort it came frome
+
+Gene
+
+```{r}
+bind_rows(
+  varPart_gene.ppmi %>%
+    mutate(study = "PPMI"),
+  varPart_gene.icicle %>%
+    mutate(study = "ICICLE-PD")
+) %>%
+  mutate(study = factor(study, levels = c("PPMI", "ICICLE-PD"))) %>%
+  varPart_plot()
+# export image
+ggsave(here("combinedLinCirc/output/figures/supp/variancePartition_gene.png"),
+  height = 5, width = 8, dpi = 600, device = agg_png
+)
+```
+
+CircRNA
+
+```{r}
+bind_rows(
+  varPart_circ.ppmi %>%
+    mutate(study = "PPMI"),
+  varPart_circ.icicle %>%
+    mutate(study = "ICICLE-PD")
+) %>%
+  mutate(study = factor(study, levels = c("PPMI", "ICICLE-PD"))) %>%
+  varPart_plot()
+# export image
+ggsave(here("combinedLinCirc/output/figures/supp/variancePartition_circRNA.png"),
+  height = 5, width = 8, dpi = 600, device = agg_png
+)
+```
+
+Combine into one facetted plot
+```{r}
+bind_rows(
+  varPart_gene.ppmi %>% 
+  mutate(study = "PPMI", type = "Gene"),
+varPart_gene.icicle %>% 
+  mutate(study = "ICICLE-PD", type = "Gene"),
+varPart_circ.ppmi %>% 
+  mutate(study = "PPMI", type = "circRNA"),
+varPart_circ.icicle %>% 
+  mutate(study = "ICICLE-PD", type = "circRNA")
+) %>%
+  mutate(study = factor(study, levels = c("PPMI", "ICICLE-PD")),
+         type = factor(type, levels = c("Gene", "circRNA"))) %>% 
+  ggplot(aes(x = var_explain, y = fct_reorder(covariate, var_explain, .fun = median, .desc = FALSE))) +
+    geom_jitter(aes(colour = covariate), alpha = 0.1) +
+    geom_boxplot(width = 0.2, outlier.shape = NA) +
+    labs(
+      x = "Proportion of variance explained", y = "Covariate",
+      colour = "Covariate"
+    ) +
+    facet_grid(type ~ study, scale = "free") +
+    theme(legend.position = "none")
+ggsave(here("combinedLinCirc/output/figures/supp/variancePartition.png"),
+       height = 5, width = 7, device = agg_png, dpi = 600)
+ggsave(here("combinedLinCirc/output/figures/supp/variancePartition.pdf"),
+       height = 5, width = 7, dpi = 600)
+```
+
